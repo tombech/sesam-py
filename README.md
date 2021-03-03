@@ -9,7 +9,7 @@ Sesam command tool to use with [Sesam](https://sesam.io).
 Typical workflow:
 
 ```
-$ sesam clean
+$ sesam wipe
 $ sesam upload
 Node config replaced with local config.
 ## edit stuff in Sesam Management Studio
