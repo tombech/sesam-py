@@ -167,8 +167,64 @@ class SesamNode:
         safe_jwt = "{}*********{}".format(jwt_token[:10], jwt_token[-10:])
         self.logger.debug("Connecting to Sesam using url '%s' and JWT '%s'", node_url, safe_jwt)
 
+        if verify_ssl is False:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
         self.api_connection = sesamclient.Connection(sesamapi_base_url=self.node_url, jwt_auth_token=self.jwt_token,
                                                      timeout=60 * 10, verify_ssl=verify_ssl)
+
+    def wait_for_all_pipes_to_deploy(self, timeout=30*60):
+        starttime = time.time()
+        deploying = {}
+        while True:
+            deployed = True
+            if deploying:
+                pipes = [p for p in deploying.values()]
+            else:
+                pipes = [p for p in self.api_connection.get_pipes()]
+
+            for pipe in pipes:
+                try:
+                    pipe.wait_for_pipe_to_be_deployed(timeout=0)
+                    deploying.pop(pipe.id, None)
+                    logger.debug(f"Pipe {pipe.id} was deployed...")
+                except BaseException as e:
+                    deployed = False
+                    deploying[pipe.id] = pipe
+                    logger.debug(f"Pipe {pipe.id} is still deploying...")
+
+            elapsedtime = time.time() - starttime
+            if not deployed and elapsedtime > timeout:
+                raise RuntimeError("Waiting for pipes to deploy timed out after %s seconds!" % timeout)
+
+            if deployed:
+                self.logger.debug("All pipes were deployed in %s seconds" % elapsedtime)
+                break
+
+            logger.info(f"Waiting for {len(deploying.values())} pipes to finish deploying...")
+            time.sleep(5)
+
+    def is_user_pipe(self, pipe):
+        return self.get_pipe_origin(pipe) not in ["system", "replica", "aggregator-storage-node"]
+
+    def get_pipe_origin(self, pipe):
+        return pipe.config.get("original", {}).get("metadata", {}).get("origin", "user")
+
+    def wait_for_all_pipes_to_disappear(self, timeout=30*60):
+        starttime = time.time()
+        while True:
+            elapsedtime = time.time() - starttime
+            pipes = [p for p in self.api_connection.get_pipes() if self.is_user_pipe(p)]
+            if not pipes:
+                self.logger.debug("All pipes were removed in %s seconds" % elapsedtime)
+                return
+
+            if elapsedtime > timeout:
+                raise RuntimeError("Waiting for pipes to br removed timed out after %s seconds!" % timeout)
+
+            logger.info(f"Waiting for {len(pipes)} pipes to be removed...")
+            time.sleep(5)
 
     def restart(self, timeout):
         old_stats = self.api_connection.get_status()
@@ -265,18 +321,6 @@ class SesamNode:
 
         return data
 
-    def remove_all_datasets(self):
-        self.logger.log(LOGLEVEL_TRACE, "Remove alle datasets from %s" % self.node_url)
-        for dataset in self.api_connection.get_datasets():
-            dataset_id = dataset.id
-            if not dataset.id.startswith("system:"):
-                try:
-                    dataset.delete()
-                    self.logger.debug("Dataset '%s' deleted" % dataset_id)
-                except BaseException as e:
-                    self.logger.error("Failed to delete dataset '%s'" % dataset.id)
-                    raise e
-
     def get_pipe_type(self, pipe):
         source_config = pipe.config["effective"].get("source",{})
         sink_config = pipe.config["effective"].get("sink",{})
@@ -299,16 +343,20 @@ class SesamNode:
         return "internal"
 
     def get_output_pipes(self):
-        return [p for p in self.api_connection.get_pipes() if self.get_pipe_type(p) == "output"]
+        return [p for p in self.api_connection.get_pipes() if self.is_user_pipe(p) and
+                self.get_pipe_type(p) == "output"]
 
     def get_input_pipes(self):
-        return [p for p in self.api_connection.get_pipes() if self.get_pipe_type(p) == "input"]
+        return [p for p in self.api_connection.get_pipes() if self.is_user_pipe(p) and
+                self.get_pipe_type(p) == "input"]
 
     def get_endpoint_pipes(self):
-        return [p for p in self.api_connection.get_pipes() if self.get_pipe_type(p) == "endpoint"]
+        return [p for p in self.api_connection.get_pipes() if self.is_user_pipe(p) and
+                self.get_pipe_type(p) == "endpoint"]
 
     def get_internal_pipes(self):
-        return [p for p in self.api_connection.get_pipes() if self.get_pipe_type(p) == "internal"]
+        return [p for p in self.api_connection.get_pipes() if self.is_user_pipe(p) and
+                self.get_pipe_type(p) == "internal"]
 
     def run_internal_scheduler(self, disable_pipes=True, zero_runs=None, max_run_time=None, max_runs=None):
         internal_scheduler_url = "%s/pipes/run-all-pipes" % self.node_url
@@ -505,6 +553,27 @@ class SesamCmdClient:
         self.args = args
         self.logger = logger
         self.sesam_node = None
+        self.whitelisted_files = None
+        self.whitelisted_pipes = None
+        self.whitelisted_systems = None
+
+        if args.whitelist_file is not None:
+            try:
+                self.whitelisted_files = []
+                self.whitelisted_pipes = []
+                self.whitelisted_systems = []
+                with open(args.whitelist_file, "r") as infile:
+                    for line in infile.read().split("\n"):
+                        self.whitelisted_files.append(line.strip())
+                        if line.startswith("pipes/"):
+                            pipe = line.replace("pipes/", "").replace("conf.json", "")
+                            self.whitelisted_pipes.append(pipe)
+                        elif line.startswith("systems/"):
+                            system = line.replace("systems/", "").replace("conf.json", "")
+                            self.whitelisted_systems.append(system)
+            except BaseException as e:
+                logger.error(f"Failed to read whitelistfile '{args.whitelist_file}'")
+                raise e
 
     def read_config_file(self, filename):
         parser = configparser.ConfigParser(strict=False)
@@ -526,6 +595,11 @@ class SesamCmdClient:
         for root, dirs, files in os.walk(dir):
             for file in files:
                 if file.endswith(".conf.json"):
+                    if self.whitelisted_files is not None:
+                        filepath = os.path.join(root, file)
+                        if filepath not in self.whitelisted_files:
+                            continue
+
                     zipfile.write(os.path.join(root, file))
 
     def get_zip_config(self, remove_zip=True):
@@ -541,7 +615,8 @@ class SesamCmdClient:
         self.zip_dir(zip_file, "systems")
 
         if os.path.isfile("node-metadata.conf.json"):
-            zip_file.write("node-metadata.conf.json")
+            if not self.whitelisted_files or "node-metadata.conf.json" in self.whitelisted_files:
+                zip_file.write("node-metadata.conf.json")
 
         zip_file.close()
 
@@ -586,25 +661,38 @@ class SesamCmdClient:
             with open("node-metadata.conf.json", "r") as infile:
                 node_metadata = json.load(infile)
 
-        if node_metadata.get("task_manager", {}).get("disable_user_pipes", False) is True:
-            # No need to do anything, the setting is originally in the file!
-            return zip_data
-
         remote_data = self.get_zipfile_data_by_filename(zip_data, "node-metadata.conf.json")
         if remote_data:
             remote_metadata = json.loads(str(remote_data, encoding="utf-8"))
 
             if "task_manager" in remote_metadata and "disable_user_pipes" in remote_metadata["task_manager"] and \
                             remote_metadata["task_manager"]["disable_user_pipes"] is True:
-                remote_metadata["task_manager"].pop("disable_user_pipes")
-                # Remove the entire task_manager section if its empty
-                if len(remote_metadata["task_manager"]) == 0:
-                    remote_metadata.pop("task_manager")
 
-                # Replace the file and return the new zipfile
-                return self.replace_file_in_zipfile(zip_data, "node-metadata.conf.json",
-                                                    json.dumps(remote_metadata, indent=2,
-                                                               ensure_ascii=False).encode("utf-8"))
+                if "disable_user_pipes" in node_metadata.get("task_manager", {}):
+                    remote_metadata["task_manager"]["disable_user_pipes"] = \
+                        node_metadata["task_manager"]["disable_user_pipes"]
+                else:
+                    remote_metadata["task_manager"].pop("disable_user_pipes")
+                    # Remove the entire task_manager section if its empty
+                    if len(remote_metadata["task_manager"]) == 0:
+                        remote_metadata.pop("task_manager")
+
+            if "global_defaults" in remote_metadata and "enable_cpp_extensions" in remote_metadata["task_manager"] and \
+                            remote_metadata["task_manager"]["enable_cpp_extensions"] is False:
+
+                if "enable_cpp_extensions" in node_metadata.get("global_defaults", {}):
+                    remote_metadata["global_defaults"]["enable_cpp_extensions"] = \
+                        node_metadata["global_defaults"]["enable_cpp_extensions"]
+                else:
+                    remote_metadata["global_defaults"].pop("enable_cpp_extensions")
+                    # Remove the entire task_manager section if its empty
+                    if len(remote_metadata["global_defaults"]) == 0:
+                        remote_metadata.pop("global_defaults")
+
+            # Replace the file and return the new zipfile
+            return self.replace_file_in_zipfile(zip_data, "node-metadata.conf.json",
+                                                json.dumps(remote_metadata, indent=2,
+                                                           ensure_ascii=False).encode("utf-8"))
 
         return zip_data
 
@@ -703,13 +791,21 @@ class SesamCmdClient:
             zip_config = self.get_zip_config(remove_zip=args.dump is False)
 
             # Modify the node-metadata.conf.json to stop the pipe scheduler
-            if self.args.disable_user_pipes and os.path.isfile("node-metadata.conf.json"):
+            if (self.args.disable_user_pipes or self.disable_cpp_extensions) and \
+                    os.path.isfile("node-metadata.conf.json"):
                 with open("node-metadata.conf.json", "r") as infile:
                     node_metadata = json.load(infile)
-                    if "task_manager" not in node_metadata:
-                        node_metadata["task_manager"] = {}
+                    if self.args.disable_user_pipes:
+                        if "task_manager" not in node_metadata:
+                            node_metadata["task_manager"] = {}
 
-                    node_metadata["task_manager"]["disable_user_pipes"] = True
+                        node_metadata["task_manager"]["disable_user_pipes"] = True
+
+                    if self.args.disable_cpp_extensions:
+                        if "global_defaults" not in node_metadata:
+                            node_metadata["global_defaults"] = {}
+
+                        node_metadata["global_defaults"]["enable_cpp_extensions"] = False
 
                     zip_config = self.replace_file_in_zipfile(zip_config, "node-metadata.conf.json",
                                                               json.dumps(node_metadata).encode("utf-8"))
@@ -723,12 +819,17 @@ class SesamCmdClient:
             self.logger.error("Failed to upload config to sesam")
             raise e
 
+        self.sesam_node.wait_for_all_pipes_to_deploy()
+
         self.logger.info("Config uploaded successfully")
 
         if os.path.isdir("testdata"):
             for root, dirs, files in os.walk("testdata"):
                 for filename in files:
                     pipe_id = filename.replace(".json", "")
+                    if self.whitelisted_pipes and pipe_id not in self.whitelisted_pipes:
+                        continue
+
                     try:
                         with open(os.path.join(root, filename), "r", encoding="utf-8") as f:
                             entities_json = json.load(f)
@@ -788,10 +889,18 @@ class SesamCmdClient:
         try:
             # Remove all previous pipes and systems
             for filename in glob.glob("pipes%s*.conf.json" % os.sep):
+                # Don't delete non-whitelisted config files
+                if self.whitelisted_files and filename not in self.whitelisted_files:
+                    continue
+
                 self.logger.debug("Deleting pipe config file '%s'" % filename)
                 os.remove(filename)
 
             for filename in glob.glob("systems%s*.conf.json" % os.sep):
+                # Don't delete non-whitelisted config files
+                if self.whitelisted_files and filename not in self.whitelisted_files:
+                    continue
+
                 self.logger.debug("Deleting system config file '%s'" % filename)
                 os.remove(filename)
 
@@ -904,6 +1013,11 @@ class SesamCmdClient:
             pipe_id = test_spec.pipe
             self.logger.log(LOGLEVEL_TRACE, "Pipe id for spec '%s' is '%s" % (filename, pipe_id))
 
+            if self.whitelisted_pipes and pipe_id not in self.whitelisted_pipes:
+                logger.warning(f"Skipping test spec for non-whitelisted pipe '{pipe_id} - add it to the whitelist if "
+                               f"this is not correct!'")
+                continue
+
             if pipe_id not in existing_output_pipes:
                 if update is False:
                     logger.error("Test spec '%s' references a non-exisiting output "
@@ -956,6 +1070,11 @@ class SesamCmdClient:
 
         if update:
             for pipe in existing_output_pipes.values():
+                if self.whitelisted_pipes and pipe.id not in self.whitelisted_pipes:
+                    logger.warning(f"Not updating non-whitelisted pipe '{pipe.id} - add it to the whitelist if "
+                                   f"this is not correct!'")
+                    continue
+
                 self.logger.debug("Updating pipe '%s" % pipe.id)
 
                 if pipe.id not in test_specs:
@@ -1031,6 +1150,11 @@ class SesamCmdClient:
         missing_tests = []
         failed = False
         for pipe in output_pipes.values():
+            if self.whitelisted_pipes and pipe.id not in self.whitelisted_pipes:
+                self.logger.warning(f"Skipping verify for pipe '{pipe.id}' - add it to the whitelist if this is not "
+                                    f"correct!")
+                continue
+
             self.logger.debug("Verifying pipe '%s'.." % pipe.id)
 
             if pipe.id in test_specs:
@@ -1233,6 +1357,12 @@ class SesamCmdClient:
         i = 0
         for pipe in output_pipes.values():
             if pipe.id in test_specs:
+                if self.whitelisted_pipes and pipe.id not in self.whitelisted_pipes:
+                    self.logger.warning(
+                        f"Skipping updating expected output for pipe '{pipe.id}' - add it to the whitelist if "
+                        f"this is not correct!")
+                    continue
+
                 self.logger.debug("Updating pipe '%s'.." % pipe.id)
 
                 # Process all tests specs for this pipe
@@ -1572,12 +1702,7 @@ class SesamCmdClient:
             logger.error("Failed to wipe environment variables")
             raise e
 
-        try:
-            self.sesam_node.remove_all_datasets()
-            self.logger.info("Removed datasets")
-        except BaseException as e:
-            self.logger.error("Failed to delete datasets")
-            raise e
+        self.sesam_node.wait_for_all_pipes_to_disappear()
 
         self.logger.info("Successfully wiped node!")
 
@@ -1718,6 +1843,9 @@ Commands:
                         default=".syncconfig", type=str, help="sync config file to use, the default is "
                                                               "'.syncconfig' in the current directory")
 
+    parser.add_argument('-whitelist-file', dest='whitelist_file', metavar="<string>",
+                        type=str, help="whitelist file to use, the default is none")
+
     parser.add_argument('-dont-remove-scheduler', dest='dont_remove_scheduler', required=False, action='store_true',
                         help="don't remove scheduler after failure")
 
@@ -1751,6 +1879,9 @@ Commands:
 
     parser.add_argument('-compact-execution-datasets', dest='compact_execution_datasets', required=False, action='store_true',
                         help="compact all execution datasets when running scheduler")
+
+    parser.add_argument('-disable-cpp-extensions', dest='disable_cpp_extensions', required=False, action='store_true',
+                        help="turns off cpp extensions which saves dtl compile time at the expense of possibly slower dtl exeution time")
 
     parser.add_argument('-unicode-encoding', dest='unicode_encoding', required=False, action='store_true',
                         help="store the 'expected output' json files using unicode encoding ('\\uXXXX') - "
@@ -1861,7 +1992,13 @@ Commands:
         parser.print_usage()
         sys.exit(1)
 
-    sesam_cmd_client = SesamCmdClient(args, logger)
+    try:
+        sesam_cmd_client = SesamCmdClient(args, logger)
+    except BaseException as e:
+        if args.verbose or args.extra_verbose:
+            logger.exception(e)
+
+        sys.exit(1)
 
     try:
         node_url, jwt_token = sesam_cmd_client.get_node_and_jwt_token()
@@ -1903,6 +2040,11 @@ Commands:
             if args.disable_user_pipes is True:
                 logger.warning("Note that the -disable-user-pipes flag has no effect on the actual node configuration "
                                "outside the 'upload' or 'test' commands")
+
+            if args.disable_cpp_extensions is True:
+                logger.warning("Note that the -disable-cpp-extensions flag has no effect on the actual node configuration "
+                               "outside the 'upload' or 'test' commands")
+
             sesam_cmd_client.run()
         elif command == "wipe":
             sesam_cmd_client.wipe()
